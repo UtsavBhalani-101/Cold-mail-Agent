@@ -1,37 +1,74 @@
 import json
 import os
+import sqlite3
 import sys
+from datetime import datetime, timezone
+from typing import Any
 
 import requests
-from ddgs import DDGS
 from bs4 import BeautifulSoup
+from ddgs import DDGS
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
-DEFAULT_PROMPT = "Find the names of people on the team page of Val Town."
-MAX_TOOL_ROUNDS = 8
-MAX_TOTAL_SEARCHES = 6
-MAX_TOTAL_FETCHES = 4
-MAX_CONTACT_SEARCHES = 2
+DEFAULT_COMPANY = "Val Town"
+DEFAULT_DB_PATH = "company_research.sqlite3"
+MAX_TOOL_ROUNDS = 10
 MAX_PAGE_CHARS = 12000
 CONFIDENCE_VALUES = {"high", "medium", "low"}
+
+STAGE_SIZE_SCHEMA = {
+    "stage": "string or null",
+    "headcount": "string or null",
+    "funding": "string or null",
+    "company_domain": "string or null",
+    "confidence": '"high" | "medium" | "low"',
+    "source_urls": ["string"],
+    "notes": "string or null",
+}
+DECISION_MAKER_SCHEMA = {
+    "likely_role": "string",
+    "decision_rule": "string",
+    "rationale": "string",
+    "confidence": '"high" | "medium" | "low"',
+}
 PERSON_SCHEMA = {
     "name": "string or null",
     "role": "string or null",
-    "email": "string or null",
-    "confidence": '"high" | "medium" | "low"',
+    "profile_url": "string or null",
     "source_url": "string",
-    "personalization_hook": "string or null",
-}
-FINAL_SCHEMA = {
-    "people": [PERSON_SCHEMA],
+    "confidence": '"high" | "medium" | "low"',
     "notes": "string or null",
 }
-REQUIRED_FINAL_KEYS = set(FINAL_SCHEMA)
-REQUIRED_PERSON_KEYS = set(PERSON_SCHEMA)
+EMAIL_SCHEMA = {
+    "email": "string or null",
+    "is_inferred": "boolean",
+    "pattern": "string or null",
+    "domain": "string or null",
+    "source_url": "string",
+    "confidence": '"high" | "medium" | "low"',
+    "notes": "string or null",
+}
+PERSONALIZATION_SCHEMA = {
+    "summary": "string or null",
+    "activity_type": "string or null",
+    "activity_date": "string or null",
+    "source_url": "string",
+    "confidence": '"high" | "medium" | "low"',
+    "notes": "string or null",
+}
+COMPANY_RESEARCH_SCHEMA = {
+    "company_name": "string",
+    "researched_at": "ISO-8601 string",
+    "stage_size": STAGE_SIZE_SCHEMA,
+    "decision_maker": DECISION_MAKER_SCHEMA,
+    "person": PERSON_SCHEMA,
+    "email": EMAIL_SCHEMA,
+    "personalization": PERSONALIZATION_SCHEMA,
+}
 
 
 def web_search(query: str) -> list[dict[str, str]]:
@@ -152,33 +189,13 @@ TOOLS_BY_NAME = {
 }
 
 
-def build_prompt(user_request: str) -> str:
-    return (
-        f"{user_request}\n\n"
-        "Use web_search to find likely pages. Use fetch_page on promising URLs to read the actual page. "
-        "Answer only after using the page text when it is available.\n"
-        "IMPORTANT SEARCH CONSTRAINTS:\n"
-        "- Do NOT perform repetitive or speculative search queries to guess or locate missing fields such as emails or personal handles.\n"
-        "- Only include emails that are explicitly visible in fetched page text or search result snippets. Never infer an address pattern.\n"
-        "- If a field such as email is not plainly visible, set it to null immediately.\n"
-        f"- You have at most {MAX_TOTAL_SEARCHES} searches, {MAX_TOTAL_FETCHES} page fetches, and {MAX_CONTACT_SEARCHES} total email/contact searches.\n"
-        "- Conclude tool usage as soon as the main request is answered.\n\n"
-        "Your final answer must be only one valid JSON object matching this schema:\n"
-        f"{json.dumps(FINAL_SCHEMA, indent=2)}\n"
-        'If you cannot find a field confidently, use null and set that person\'s "confidence" to "low" rather than guessing. '
-        'Set "source_url" to the URL that best supports each person, or an empty string if no source supports it. '
-        "Use notes for brief uncertainty, including when public emails were not found. "
-        "Do not wrap the JSON in markdown or include any extra text."
-    )
-
-
 def normalize_text(value: object) -> str:
     return " ".join(str(value or "").lower().split())
 
 
 def is_contact_search(query: str) -> bool:
     query = normalize_text(query)
-    contact_terms = ("email", "e-mail", "@", "contact", "mail", "linkedin")
+    contact_terms = ("email", "e-mail", "@", "contact", "mail", "hunter", "apollo", "rocketreach")
     return any(term in query for term in contact_terms)
 
 
@@ -187,12 +204,29 @@ def budget_error(message: str) -> dict[str, object]:
         "error": message,
         "instruction": (
             "Do not call more tools for this missing information. Return the final JSON now, "
-            "using null for unknown fields."
+            "using null for unknown fields or a clearly marked inference when requested."
         ),
     }
 
 
-def call_tool(function_call: types.FunctionCall, tool_state: dict[str, object]) -> dict[str, object]:
+def new_tool_state(
+    max_searches: int,
+    max_fetches: int,
+    max_contact_searches: int,
+) -> dict[str, Any]:
+    return {
+        "searches": 0,
+        "fetches": 0,
+        "contact_searches": 0,
+        "max_searches": max_searches,
+        "max_fetches": max_fetches,
+        "max_contact_searches": max_contact_searches,
+        "seen_queries": set(),
+        "seen_urls": set(),
+    }
+
+
+def call_tool(function_call: types.FunctionCall, tool_state: dict[str, Any]) -> dict[str, object]:
     tool = TOOLS_BY_NAME.get(function_call.name)
     if tool is None:
         return {"error": f"Unknown tool: {function_call.name}"}
@@ -205,11 +239,11 @@ def call_tool(function_call: types.FunctionCall, tool_state: dict[str, object]) 
             if query in seen_queries:
                 return budget_error(f"Duplicate search blocked: {args.get('query')}")
 
-            if tool_state["searches"] >= MAX_TOTAL_SEARCHES:
+            if tool_state["searches"] >= tool_state["max_searches"]:
                 return budget_error("Search budget exhausted.")
 
             if is_contact_search(query):
-                if tool_state["contact_searches"] >= MAX_CONTACT_SEARCHES:
+                if tool_state["contact_searches"] >= tool_state["max_contact_searches"]:
                     return budget_error("Email/contact search budget exhausted.")
                 tool_state["contact_searches"] += 1
 
@@ -222,7 +256,7 @@ def call_tool(function_call: types.FunctionCall, tool_state: dict[str, object]) 
             if url in seen_urls:
                 return budget_error(f"Duplicate fetch blocked: {args.get('url')}")
 
-            if tool_state["fetches"] >= MAX_TOTAL_FETCHES:
+            if tool_state["fetches"] >= tool_state["max_fetches"]:
                 return budget_error("Fetch budget exhausted.")
 
             seen_urls.add(url)
@@ -238,65 +272,47 @@ def call_tool(function_call: types.FunctionCall, tool_state: dict[str, object]) 
         return {"error": str(exc)}
 
 
-def parse_final_json(text: str) -> dict[str, object]:
+def parse_json_object(text: str) -> dict[str, Any]:
     data = json.loads(text)
     if not isinstance(data, dict):
         raise ValueError("Final answer must be a JSON object.")
-
-    missing_keys = REQUIRED_FINAL_KEYS - set(data)
-    extra_keys = set(data) - REQUIRED_FINAL_KEYS
-    if missing_keys:
-        raise ValueError(f"Missing required keys: {sorted(missing_keys)}")
-    if extra_keys:
-        raise ValueError(f"Unexpected keys: {sorted(extra_keys)}")
-
-    if not isinstance(data["people"], list):
-        raise ValueError("people must be an array.")
-
-    for index, person in enumerate(data["people"]):
-        if not isinstance(person, dict):
-            raise ValueError(f"people[{index}] must be an object.")
-
-        missing_person_keys = REQUIRED_PERSON_KEYS - set(person)
-        extra_person_keys = set(person) - REQUIRED_PERSON_KEYS
-        if missing_person_keys:
-            raise ValueError(f"people[{index}] missing required keys: {sorted(missing_person_keys)}")
-        if extra_person_keys:
-            raise ValueError(f"people[{index}] has unexpected keys: {sorted(extra_person_keys)}")
-
-        nullable_string_fields = ["name", "role", "email", "personalization_hook"]
-        for field in nullable_string_fields:
-            if person[field] is not None and not isinstance(person[field], str):
-                raise ValueError(f"people[{index}].{field} must be a string or null.")
-
-        if person["confidence"] not in CONFIDENCE_VALUES:
-            raise ValueError(f'people[{index}].confidence must be "high", "medium", or "low".')
-
-        if not isinstance(person["source_url"], str):
-            raise ValueError(f"people[{index}].source_url must be a string.")
-
-    if data["notes"] is not None and not isinstance(data["notes"], str):
-        raise ValueError("notes must be a string or null.")
-
     return data
 
 
-def print_valid_final_json(text: str) -> bool:
-    try:
-        data = parse_final_json(text)
-    except (json.JSONDecodeError, ValueError) as exc:
-        print(f"Invalid JSON final answer: {exc}", file=sys.stderr)
-        return False
+def build_agent_prompt(task: str, schema: dict[str, Any], context: dict[str, Any] | None = None) -> str:
+    context_text = json.dumps(context or {}, indent=2, ensure_ascii=False)
+    return (
+        f"{task}\n\n"
+        "Use web_search for discovery and fetch_page only for URLs likely to contain direct evidence. "
+        "Do not repeat equivalent searches. Do not keep searching for fields after the available evidence is exhausted. "
+        "Only treat emails as verified when they are explicitly visible in fetched page text or search snippets. "
+        "When the task asks for email inference, mark is_inferred=true and keep confidence low unless a source verifies the address.\n\n"
+        f"Prior context:\n{context_text}\n\n"
+        "Return only one valid JSON object matching this schema:\n"
+        f"{json.dumps(schema, indent=2)}\n"
+        'Use null for unknown values and "low" confidence when uncertain. Do not include markdown or extra text.'
+    )
 
-    print(json.dumps(data, indent=2, ensure_ascii=False))
-    return True
+
+def make_client() -> tuple[genai.Client, str]:
+    load_dotenv()
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Missing GEMINI_API_KEY. Add it to your .env file, for example: "
+            "GEMINI_API_KEY=your_api_key_here"
+        )
+
+    model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
+    return genai.Client(api_key=api_key), model
 
 
 def force_final_answer(
     client: genai.Client,
     model: str,
     contents: list[types.Content],
-) -> int:
+) -> dict[str, Any]:
     contents.append(
         types.Content(
             role="user",
@@ -304,8 +320,8 @@ def force_final_answer(
                 types.Part.from_text(
                     text=(
                         "Stop using tools. Based only on the evidence already returned by tools, "
-                        "produce the final JSON now. Use null for emails or other fields that were "
-                        "not explicitly visible in the tool results."
+                        "produce the final JSON now. Use null for unknown fields. If an email is only "
+                        "inferred, clearly set is_inferred=true."
                     )
                 )
             ],
@@ -316,44 +332,35 @@ def force_final_answer(
         contents=contents,
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
-    return 0 if print_valid_final_json(final_response.text or "") else 1
+    return parse_json_object(final_response.text or "{}")
 
 
-def main() -> int:
-    load_dotenv()
-
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        print(
-            "Missing GEMINI_API_KEY. Add it to your .env file, for example:\n"
-            "GEMINI_API_KEY=your_api_key_here",
-            file=sys.stderr,
+def run_agent(
+    client: genai.Client,
+    model: str,
+    task: str,
+    schema: dict[str, Any],
+    context: dict[str, Any] | None = None,
+    max_searches: int = 4,
+    max_fetches: int = 2,
+    max_contact_searches: int = 1,
+) -> dict[str, Any]:
+    use_tools = max_searches > 0 or max_fetches > 0
+    if use_tools:
+        tool = types.Tool(function_declarations=[web_search_declaration, fetch_page_declaration])
+        config = types.GenerateContentConfig(
+            tools=[tool],
+            response_mime_type="application/json",
         )
-        return 1
-
-    model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
-    client = genai.Client(api_key=api_key)
-    tool = types.Tool(function_declarations=[web_search_declaration, fetch_page_declaration])
-    config = types.GenerateContentConfig(
-        tools=[tool],
-        response_mime_type="application/json",
-    )
-    user_request = " ".join(sys.argv[1:]).strip() or os.getenv("TEST_PROMPT", DEFAULT_PROMPT)
-    prompt = build_prompt(user_request)
-
+    else:
+        config = types.GenerateContentConfig(response_mime_type="application/json")
     contents = [
         types.Content(
             role="user",
-            parts=[types.Part.from_text(text=prompt)],
+            parts=[types.Part.from_text(text=build_agent_prompt(task, schema, context))],
         )
     ]
-    tool_state = {
-        "searches": 0,
-        "fetches": 0,
-        "contact_searches": 0,
-        "seen_queries": set(),
-        "seen_urls": set(),
-    }
+    tool_state = new_tool_state(max_searches, max_fetches, max_contact_searches)
 
     for _ in range(MAX_TOOL_ROUNDS):
         response = client.models.generate_content(
@@ -364,64 +371,240 @@ def main() -> int:
 
         function_calls = response.function_calls or []
         if not function_calls:
-            if print_valid_final_json(response.text or ""):
-                return 0
-
-            contents.append(response.candidates[0].content)
-            contents.append(
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_text(
-                            text=(
-                                "Retry once. Return only a valid JSON object with exactly these keys: "
-                                f"{', '.join(sorted(REQUIRED_FINAL_KEYS))}. "
-                                'Use null for unknown values, and use "low" confidence if anything is uncertain.'
-                            )
-                        )
-                    ],
-                )
-            )
-
-            retry_response = client.models.generate_content(
-                model=model,
-                contents=contents,
-                config=types.GenerateContentConfig(response_mime_type="application/json"),
-            )
-
-            if retry_response.function_calls:
-                print("Retry produced tool calls instead of final JSON.", file=sys.stderr)
-                return 1
-            return 0 if print_valid_final_json(retry_response.text or "") else 1
+            try:
+                return parse_json_object(response.text or "{}")
+            except (json.JSONDecodeError, ValueError):
+                contents.append(response.candidates[0].content)
+                return force_final_answer(client, model, contents)
 
         contents.append(response.candidates[0].content)
-
         for function_call in function_calls:
             print(
                 f"Calling tool: {function_call.name}({dict(function_call.args or {})})",
                 file=sys.stderr,
             )
             tool_response = call_tool(function_call, tool_state)
-            function_response_part = types.Part.from_function_response(
-                name=function_call.name,
-                response=tool_response,
-            )
             contents.append(
                 types.Content(
                     role="user",
-                    parts=[function_response_part],
+                    parts=[
+                        types.Part.from_function_response(
+                            name=function_call.name,
+                            response=tool_response,
+                        )
+                    ],
                 )
             )
 
         if (
-            tool_state["searches"] >= MAX_TOTAL_SEARCHES
-            or tool_state["fetches"] >= MAX_TOTAL_FETCHES
-            or tool_state["contact_searches"] >= MAX_CONTACT_SEARCHES
+            tool_state["searches"] >= tool_state["max_searches"]
+            or tool_state["fetches"] >= tool_state["max_fetches"]
+            or (
+                tool_state["max_contact_searches"] > 0
+                and tool_state["contact_searches"] >= tool_state["max_contact_searches"]
+            )
         ):
             return force_final_answer(client, model, contents)
 
-    print("Tool round limit reached; forcing a final JSON answer.", file=sys.stderr)
     return force_final_answer(client, model, contents)
+
+
+def init_db(db_path: str) -> None:
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS company_research (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_name TEXT NOT NULL,
+                researched_at TEXT NOT NULL,
+                stage TEXT,
+                headcount TEXT,
+                funding TEXT,
+                company_domain TEXT,
+                decision_maker_role TEXT,
+                person_name TEXT,
+                person_role TEXT,
+                email TEXT,
+                email_is_inferred INTEGER NOT NULL,
+                personalization_summary TEXT,
+                record_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_company_research_company_name
+            ON company_research(company_name)
+            """
+        )
+
+
+def save_company_research(record: dict[str, Any], db_path: str | None = None) -> None:
+    db_path = db_path or os.getenv("RESEARCH_DB_PATH", DEFAULT_DB_PATH)
+    init_db(db_path)
+
+    stage_size = record.get("stage_size") or {}
+    decision_maker = record.get("decision_maker") or {}
+    person = record.get("person") or {}
+    email = record.get("email") or {}
+    personalization = record.get("personalization") or {}
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO company_research (
+                company_name,
+                researched_at,
+                stage,
+                headcount,
+                funding,
+                company_domain,
+                decision_maker_role,
+                person_name,
+                person_role,
+                email,
+                email_is_inferred,
+                personalization_summary,
+                record_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.get("company_name"),
+                record.get("researched_at"),
+                stage_size.get("stage"),
+                stage_size.get("headcount"),
+                stage_size.get("funding"),
+                stage_size.get("company_domain"),
+                decision_maker.get("likely_role"),
+                person.get("name"),
+                person.get("role"),
+                email.get("email"),
+                1 if email.get("is_inferred") else 0,
+                personalization.get("summary"),
+                json.dumps(record, ensure_ascii=False),
+            ),
+        )
+
+
+def research_company(company_name: str, db_path: str | None = None) -> dict[str, Any]:
+    client, model = make_client()
+    company_name = company_name.strip()
+    if not company_name:
+        raise ValueError("company_name is required.")
+
+    stage_size = run_agent(
+        client=client,
+        model=model,
+        task=(
+            f"Determine the stage and size of {company_name}. Search for funding, headcount, "
+            "LinkedIn/company size snippets, Crunchbase/Tracxn-style summaries, and the official domain."
+        ),
+        schema=STAGE_SIZE_SCHEMA,
+        max_searches=3,
+        max_fetches=2,
+        max_contact_searches=0,
+    )
+
+    decision_maker = run_agent(
+        client=client,
+        model=model,
+        task=(
+            "Infer the likely hiring decision-maker role for outbound recruiting. "
+            "Use this rule: if the company appears to have fewer than 20 people, choose founder/co-founder; "
+            "otherwise choose hiring manager, talent acquisition, recruiter, head of people, or department leader."
+        ),
+        schema=DECISION_MAKER_SCHEMA,
+        context={
+            "company_name": company_name,
+            "stage_size": stage_size,
+        },
+        max_searches=0,
+        max_fetches=0,
+        max_contact_searches=0,
+    )
+
+    person = run_agent(
+        client=client,
+        model=model,
+        task=(
+            f"Find the best matching person's name at {company_name} for this target role: "
+            f"{decision_maker.get('likely_role')}. Search the official team/about page, GitHub org, "
+            "and Google-indexed LinkedIn using site:linkedin.com. Return one best person."
+        ),
+        schema=PERSON_SCHEMA,
+        context={
+            "company_name": company_name,
+            "stage_size": stage_size,
+            "decision_maker": decision_maker,
+        },
+        max_searches=4,
+        max_fetches=2,
+        max_contact_searches=1,
+    )
+
+    email = run_agent(
+        client=client,
+        model=model,
+        task=(
+            "Find or infer the person's email. First search for a public verified email for the person. "
+            "If none is visible, infer a likely address from the company domain using common patterns such as "
+            "first@domain, first.last@domain, firstinitiallast@domain, or firstlast@domain. "
+            "Never mark an inferred address as verified."
+        ),
+        schema=EMAIL_SCHEMA,
+        context={
+            "company_name": company_name,
+            "stage_size": stage_size,
+            "person": person,
+        },
+        max_searches=2,
+        max_fetches=1,
+        max_contact_searches=2,
+    )
+
+    personalization = run_agent(
+        client=client,
+        model=model,
+        task=(
+            "Find one recent public thing this person did for cold-email personalization. "
+            "Prefer a blog post, GitHub activity, conference/podcast appearance, public LinkedIn-indexed post, "
+            "tweet/X result, funding announcement quote, or company news mention."
+        ),
+        schema=PERSONALIZATION_SCHEMA,
+        context={
+            "company_name": company_name,
+            "person": person,
+            "email": email,
+        },
+        max_searches=3,
+        max_fetches=2,
+        max_contact_searches=0,
+    )
+
+    record = {
+        "company_name": company_name,
+        "researched_at": datetime.now(timezone.utc).isoformat(),
+        "stage_size": stage_size,
+        "decision_maker": decision_maker,
+        "person": person,
+        "email": email,
+        "personalization": personalization,
+    }
+    save_company_research(record, db_path=db_path)
+    return record
+
+
+def main() -> int:
+    company_name = " ".join(sys.argv[1:]).strip() or os.getenv("COMPANY_NAME", DEFAULT_COMPANY)
+    try:
+        record = research_company(company_name)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(json.dumps(record, indent=2, ensure_ascii=False))
+    return 0
 
 
 if __name__ == "__main__":
