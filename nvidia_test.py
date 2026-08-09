@@ -1,6 +1,6 @@
 import json
 import os
-import sqlite3
+import re
 import sys
 from datetime import datetime, timezone
 from time import sleep
@@ -10,14 +10,13 @@ import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 
 
-DEFAULT_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_MODEL = "openai/gpt-oss-20b"
 DEFAULT_COMPANY = "Val Town"
-DEFAULT_DB_PATH = "company_research.sqlite3"
-ABSTRACT_EMAIL_VALIDATION_URL = "https://emailreputation.abstractapi.com/v1/?api_key=4d9e3593f7c84481973f3ee6c6ba0dc8&email=utsavbhalani.tech@gmail.com"
+DEFAULT_REPORT_PATH = "results/company_research.md"
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+ABSTRACT_EMAIL_VALIDATION_URL = "https://emailvalidation.abstractapi.com/v1/"
 ABSTRACT_RATE_LIMIT_DELAY_SECONDS = 1.1
 MAX_TOOL_ROUNDS = 10
 MAX_PAGE_CHARS = 12000
@@ -265,70 +264,50 @@ def append_note(existing_note: object, extra_note: str) -> str:
     return extra_note
 
 
-web_search_declaration = types.FunctionDeclaration(
-    name="web_search",
-    description=(
-        "Search the web using DuckDuckGo and return the top 5 results. "
-        "Use this when current or source-backed public web information is needed."
-    ),
-    parameters_json_schema={
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "The search query to run.",
-            }
-        },
-        "required": ["query"],
-        "additionalProperties": False,
-    },
-    response_json_schema={
-        "type": "object",
-        "properties": {
-            "results": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "url": {"type": "string"},
-                        "snippet": {"type": "string"},
-                    },
-                    "required": ["title", "url", "snippet"],
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web using DuckDuckGo and return the top 5 results. "
+                "Use this when current or source-backed public web information is needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query to run.",
+                    }
                 },
-            }
+                "required": ["query"],
+                "additionalProperties": False,
+            },
         },
-        "required": ["results"],
     },
-)
-
-
-fetch_page_declaration = types.FunctionDeclaration(
-    name="fetch_page",
-    description=(
-        "Fetch a web page by URL and return readable visible text with HTML tags removed. "
-        "Use this after web_search when a result URL looks likely to contain the answer."
-    ),
-    parameters_json_schema={
-        "type": "object",
-        "properties": {
-            "url": {
-                "type": "string",
-                "description": "The full URL of the page to fetch.",
-            }
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_page",
+            "description": (
+                "Fetch a web page by URL and return readable visible text with HTML tags removed. "
+                "Use this after web_search when a result URL looks likely to contain the answer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The full URL of the page to fetch.",
+                    }
+                },
+                "required": ["url"],
+                "additionalProperties": False,
+            },
         },
-        "required": ["url"],
-        "additionalProperties": False,
     },
-    response_json_schema={
-        "type": "object",
-        "properties": {
-            "url": {"type": "string"},
-            "text": {"type": "string"},
-        },
-        "required": ["url", "text"],
-    },
-)
+]
 
 
 TOOLS_BY_NAME = {
@@ -374,14 +353,14 @@ def new_tool_state(
     }
 
 
-def call_tool(function_call: types.FunctionCall, tool_state: dict[str, Any]) -> dict[str, object]:
-    tool = TOOLS_BY_NAME.get(function_call.name)
+def call_tool(tool_name: str, tool_args: dict[str, Any], tool_state: dict[str, Any]) -> dict[str, object]:
+    tool = TOOLS_BY_NAME.get(tool_name)
     if tool is None:
-        return {"error": f"Unknown tool: {function_call.name}"}
+        return {"error": f"Unknown tool: {tool_name}"}
 
     try:
-        args = dict(function_call.args or {})
-        if function_call.name == "web_search":
+        args = dict(tool_args or {})
+        if tool_name == "web_search":
             query = normalize_text(args.get("query"))
             seen_queries = tool_state["seen_queries"]
             if query in seen_queries:
@@ -398,7 +377,7 @@ def call_tool(function_call: types.FunctionCall, tool_state: dict[str, Any]) -> 
             seen_queries.add(query)
             tool_state["searches"] += 1
 
-        if function_call.name == "fetch_page":
+        if tool_name == "fetch_page":
             url = normalize_text(args.get("url")).rstrip("/")
             seen_urls = tool_state["seen_urls"]
             if url in seen_urls:
@@ -411,9 +390,9 @@ def call_tool(function_call: types.FunctionCall, tool_state: dict[str, Any]) -> 
             tool_state["fetches"] += 1
 
         result = tool(**args)
-        if function_call.name == "web_search":
+        if tool_name == "web_search":
             return {"results": result}
-        if function_call.name == "fetch_page":
+        if tool_name == "fetch_page":
             return result
         return {"result": result}
     except Exception as exc:
@@ -442,50 +421,76 @@ def build_agent_prompt(task: str, schema: dict[str, Any], context: dict[str, Any
     )
 
 
-def make_client() -> tuple[genai.Client, str]:
+def make_client() -> tuple[str, str, str]:
     load_dotenv()
 
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("NIM_API_KEY") or os.getenv("NVIDIA_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "Missing GEMINI_API_KEY. Add it to your .env file, for example: "
-            "GEMINI_API_KEY=your_api_key_here"
+            "Missing NIM_API_KEY or NVIDIA_API_KEY. Add it to your .env file, for example: "
+            "NIM_API_KEY=your_api_key_here"
         )
 
-    model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
-    return genai.Client(api_key=api_key), model
+    model = os.getenv("NIM_MODEL") or os.getenv("NVIDIA_MODEL") or DEFAULT_MODEL
+    base_url = (os.getenv("NVIDIA_BASE_URL") or NVIDIA_BASE_URL).rstrip("/")
+    return api_key, model, base_url
+
+
+def create_chat_completion(
+    api_key: str,
+    base_url: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    response = requests.post(
+        f"{base_url}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError("NVIDIA API returned a non-object response.")
+    return data
 
 
 def force_final_answer(
-    client: genai.Client,
+    api_key: str,
     model: str,
-    contents: list[types.Content],
+    base_url: str,
+    messages: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    contents.append(
-        types.Content(
-            role="user",
-            parts=[
-                types.Part.from_text(
-                    text=(
-                        "Stop using tools. Based only on the evidence already returned by tools, "
-                        "produce the final JSON now. Use null for unknown fields. If an email is only "
-                        "inferred, clearly set is_inferred=true."
-                    )
-                )
-            ],
-        )
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Stop using tools. Based only on the evidence already returned by tools, "
+                "produce the final JSON now. Use null for unknown fields. If an email is only "
+                "inferred, clearly set is_inferred=true."
+            ),
+        }
     )
-    final_response = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    final_response = create_chat_completion(
+        api_key,
+        base_url,
+        {
+            "model": model,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+            "temperature": 0.2,
+        },
     )
-    return parse_json_object(final_response.text or "{}")
+    content = final_response["choices"][0]["message"].get("content") or "{}"
+    return parse_json_object(content)
 
 
 def run_agent(
-    client: genai.Client,
+    api_key: str,
     model: str,
+    base_url: str,
     task: str,
     schema: dict[str, Any],
     context: dict[str, Any] | None = None,
@@ -494,54 +499,51 @@ def run_agent(
     max_contact_searches: int = 1,
 ) -> dict[str, Any]:
     use_tools = max_searches > 0 or max_fetches > 0
-    if use_tools:
-        tool = types.Tool(function_declarations=[web_search_declaration, fetch_page_declaration])
-        config = types.GenerateContentConfig(
-            tools=[tool],
-            response_mime_type="application/json",
-        )
-    else:
-        config = types.GenerateContentConfig(response_mime_type="application/json")
-    contents = [
-        types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=build_agent_prompt(task, schema, context))],
-        )
-    ]
+    messages = [{"role": "user", "content": build_agent_prompt(task, schema, context)}]
     tool_state = new_tool_state(max_searches, max_fetches, max_contact_searches)
 
     for _ in range(MAX_TOOL_ROUNDS):
-        response = client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=config,
-        )
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+            "temperature": 0.2,
+        }
+        if use_tools:
+            payload["tools"] = TOOLS
+            payload["tool_choice"] = "auto"
 
-        function_calls = response.function_calls or []
-        if not function_calls:
+        response = create_chat_completion(api_key, base_url, payload)
+        response_message = response["choices"][0]["message"]
+        tool_calls = response_message.get("tool_calls") or []
+        if not tool_calls:
             try:
-                return parse_json_object(response.text or "{}")
+                return parse_json_object(response_message.get("content") or "{}")
             except (json.JSONDecodeError, ValueError):
-                contents.append(response.candidates[0].content)
-                return force_final_answer(client, model, contents)
+                messages.append(response_message)
+                return force_final_answer(api_key, model, base_url, messages)
 
-        contents.append(response.candidates[0].content)
-        for function_call in function_calls:
+        messages.append(response_message)
+        for tool_call in tool_calls:
+            function = tool_call.get("function") or {}
+            function_name = function.get("name") or ""
+            function_args_text = function.get("arguments") or "{}"
+            try:
+                function_args = json.loads(function_args_text)
+            except json.JSONDecodeError:
+                function_args = {}
             print(
-                f"Calling tool: {function_call.name}({dict(function_call.args or {})})",
+                f"Calling tool: {function_name}({function_args})",
                 file=sys.stderr,
             )
-            tool_response = call_tool(function_call, tool_state)
-            contents.append(
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_function_response(
-                            name=function_call.name,
-                            response=tool_response,
-                        )
-                    ],
-                )
+            tool_response = call_tool(function_name, function_args, tool_state)
+            messages.append(
+                {
+                    "tool_call_id": tool_call.get("id"),
+                    "role": "tool",
+                    "name": function_name,
+                    "content": json.dumps(tool_response, ensure_ascii=False),
+                }
             )
 
         if (
@@ -552,98 +554,130 @@ def run_agent(
                 and tool_state["contact_searches"] >= tool_state["max_contact_searches"]
             )
         ):
-            return force_final_answer(client, model, contents)
+            return force_final_answer(api_key, model, base_url, messages)
 
-    return force_final_answer(client, model, contents)
-
-
-def init_db(db_path: str) -> None:
-    with sqlite3.connect(db_path) as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS company_research (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                company_name TEXT NOT NULL,
-                researched_at TEXT NOT NULL,
-                stage TEXT,
-                headcount TEXT,
-                funding TEXT,
-                company_domain TEXT,
-                decision_maker_role TEXT,
-                person_name TEXT,
-                person_role TEXT,
-                email TEXT,
-                email_is_inferred INTEGER NOT NULL,
-                personalization_summary TEXT,
-                record_json TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_company_research_company_name
-            ON company_research(company_name)
-            """
-        )
+    return force_final_answer(api_key, model, base_url, messages)
 
 
-def save_company_research(record: dict[str, Any], db_path: str | None = None) -> None:
-    db_path = db_path or os.getenv("RESEARCH_DB_PATH", DEFAULT_DB_PATH)
-    init_db(db_path)
+def markdown_value(value: object) -> str:
+    if value is None or value == "":
+        return "N/A"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) if value else "N/A"
+    return str(value)
 
+
+def markdown_link(value: object) -> str:
+    text = markdown_value(value)
+    if text == "N/A":
+        return text
+    return f"[{text}]({text})"
+
+
+def format_company_research_markdown(record: dict[str, Any]) -> str:
     stage_size = record.get("stage_size") or {}
     decision_maker = record.get("decision_maker") or {}
     person = record.get("person") or {}
     email = record.get("email") or {}
     personalization = record.get("personalization") or {}
 
-    with sqlite3.connect(db_path) as connection:
-        connection.execute(
-            """
-            INSERT INTO company_research (
-                company_name,
-                researched_at,
-                stage,
-                headcount,
-                funding,
-                company_domain,
-                decision_maker_role,
-                person_name,
-                person_role,
-                email,
-                email_is_inferred,
-                personalization_summary,
-                record_json
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                record.get("company_name"),
-                record.get("researched_at"),
-                stage_size.get("stage"),
-                stage_size.get("headcount"),
-                stage_size.get("funding"),
-                stage_size.get("company_domain"),
-                decision_maker.get("likely_role"),
-                person.get("name"),
-                person.get("role"),
-                email.get("email"),
-                1 if email.get("is_inferred") else 0,
-                personalization.get("summary"),
-                json.dumps(record, ensure_ascii=False),
-            ),
-        )
+    source_urls = stage_size.get("source_urls") or []
+    source_lines = "\n".join(f"- {markdown_link(url)}" for url in source_urls) or "- N/A"
+    raw_json = json.dumps(record, indent=2, ensure_ascii=False)
+
+    return (
+        f"## {markdown_value(record.get('company_name'))}\n\n"
+        f"- Researched at: {markdown_value(record.get('researched_at'))}\n\n"
+        "### Company\n\n"
+        f"- Domain: {markdown_value(stage_size.get('company_domain'))}\n"
+        f"- Stage: {markdown_value(stage_size.get('stage'))}\n"
+        f"- Headcount: {markdown_value(stage_size.get('headcount'))}\n"
+        f"- Funding: {markdown_value(stage_size.get('funding'))}\n"
+        f"- Confidence: {markdown_value(stage_size.get('confidence'))}\n"
+        f"- Notes: {markdown_value(stage_size.get('notes'))}\n\n"
+        "### Decision Maker\n\n"
+        f"- Likely role: {markdown_value(decision_maker.get('likely_role'))}\n"
+        f"- Confidence: {markdown_value(decision_maker.get('confidence'))}\n"
+        f"- Rationale: {markdown_value(decision_maker.get('rationale'))}\n\n"
+        "### Person\n\n"
+        f"- Name: {markdown_value(person.get('name'))}\n"
+        f"- Role: {markdown_value(person.get('role'))}\n"
+        f"- Profile: {markdown_link(person.get('profile_url'))}\n"
+        f"- Source: {markdown_link(person.get('source_url'))}\n"
+        f"- Confidence: {markdown_value(person.get('confidence'))}\n"
+        f"- Notes: {markdown_value(person.get('notes'))}\n\n"
+        "### Email\n\n"
+        f"- Email: {markdown_value(email.get('email'))}\n"
+        f"- Inferred: {markdown_value(email.get('is_inferred'))}\n"
+        f"- Pattern: {markdown_value(email.get('pattern'))}\n"
+        f"- Domain: {markdown_value(email.get('domain'))}\n"
+        f"- Confidence: {markdown_value(email.get('confidence'))}\n"
+        f"- Verification status: {markdown_value(email.get('verification_status'))}\n"
+        f"- Needs manual check: {markdown_value(email.get('needs_manual_check'))}\n"
+        f"- Catch-all domain: {markdown_value(email.get('is_catch_all_domain'))}\n"
+        f"- Catch-all probe: {markdown_value(email.get('catch_all_check_email'))}\n"
+        f"- Source: {markdown_link(email.get('source_url'))}\n"
+        f"- Notes: {markdown_value(email.get('notes'))}\n\n"
+        "### Personalization\n\n"
+        f"- Summary: {markdown_value(personalization.get('summary'))}\n"
+        f"- Activity type: {markdown_value(personalization.get('activity_type'))}\n"
+        f"- Activity date: {markdown_value(personalization.get('activity_date'))}\n"
+        f"- Source: {markdown_link(personalization.get('source_url'))}\n"
+        f"- Confidence: {markdown_value(personalization.get('confidence'))}\n"
+        f"- Notes: {markdown_value(personalization.get('notes'))}\n\n"
+        "### Company Sources\n\n"
+        f"{source_lines}\n\n"
+        "<details>\n"
+        "<summary>Raw JSON</summary>\n\n"
+        "```json\n"
+        f"{raw_json}\n"
+        "```\n"
+        "</details>\n"
+    )
 
 
-def research_company(company_name: str, db_path: str | None = None) -> dict[str, Any]:
-    client, model = make_client()
+def slugify_filename(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "company"
+
+
+def save_company_research_report(record: dict[str, Any], report_path: str | None = None) -> str:
+    report_path = report_path or os.getenv("RESEARCH_REPORT_PATH", DEFAULT_REPORT_PATH)
+    report_dir = os.path.dirname(report_path)
+    if report_dir:
+        os.makedirs(report_dir, exist_ok=True)
+
+    report_exists = os.path.exists(report_path) and os.path.getsize(report_path) > 0
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    company_slug = slugify_filename(str(record.get("company_name") or DEFAULT_COMPANY))
+    entry = format_company_research_markdown(record)
+    header = "" if report_exists else "# Company Research\n\n"
+
+    with open(report_path, "a", encoding="utf-8") as report:
+        report.write(f"{header}{entry}\n\n---\n\n")
+
+    snapshot_path = os.path.join(
+        report_dir or ".",
+        f"results/company_research_{company_slug}_{timestamp}.md",
+    )
+    with open(snapshot_path, "w", encoding="utf-8") as snapshot:
+        snapshot.write(f"# Company Research\n\n{entry}\n")
+
+    return os.path.abspath(snapshot_path)
+
+
+def research_company(company_name: str, report_path: str | None = None) -> dict[str, Any]:
+    api_key, model, base_url = make_client()
     company_name = company_name.strip()
     if not company_name:
         raise ValueError("company_name is required.")
 
     stage_size = run_agent(
-        client=client,
+        api_key=api_key,
         model=model,
+        base_url=base_url,
         task=(
             f"Determine the stage and size of {company_name}. Search for funding, headcount, "
             "LinkedIn/company size snippets, Crunchbase/Tracxn-style summaries, and the official domain."
@@ -655,8 +689,9 @@ def research_company(company_name: str, db_path: str | None = None) -> dict[str,
     )
 
     decision_maker = run_agent(
-        client=client,
+        api_key=api_key,
         model=model,
+        base_url=base_url,
         task=(
             "Infer the likely hiring decision-maker role for outbound recruiting. "
             "Use this rule: if the company appears to have fewer than 20 people, choose founder/co-founder; "
@@ -673,8 +708,9 @@ def research_company(company_name: str, db_path: str | None = None) -> dict[str,
     )
 
     person = run_agent(
-        client=client,
+        api_key=api_key,
         model=model,
+        base_url=base_url,
         task=(
             f"Find the best matching person's name at {company_name} for this target role: "
             f"{decision_maker.get('likely_role')}. Search the official team/about page, GitHub org, "
@@ -692,8 +728,9 @@ def research_company(company_name: str, db_path: str | None = None) -> dict[str,
     )
 
     email = run_agent(
-        client=client,
+        api_key=api_key,
         model=model,
+        base_url=base_url,
         task=(
             "Find or infer the person's email. First search for a public verified email for the person. "
             "If none is visible, infer a likely address from the company domain using common patterns such as "
@@ -713,8 +750,9 @@ def research_company(company_name: str, db_path: str | None = None) -> dict[str,
     email = verify_email(email)
 
     personalization = run_agent(
-        client=client,
+        api_key=api_key,
         model=model,
+        base_url=base_url,
         task=(
             "Find one recent public thing this person did for cold-email personalization. "
             "Prefer a blog post, GitHub activity, conference/podcast appearance, public LinkedIn-indexed post, "
@@ -740,7 +778,7 @@ def research_company(company_name: str, db_path: str | None = None) -> dict[str,
         "email": email,
         "personalization": personalization,
     }
-    save_company_research(record, db_path=db_path)
+    record["report_path"] = save_company_research_report(record, report_path=report_path)
     return record
 
 
@@ -752,6 +790,9 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+    report_path = record.get("report_path")
+    if report_path:
+        print(f"Saved report: {report_path}", file=sys.stderr)
     print(json.dumps(record, indent=2, ensure_ascii=False))
     return 0
 

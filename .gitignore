@@ -2,3 +2,7 @@
 .venv
 __pycache__
 company_research.sqlite3
+to do.md
+PROJECT_CONTEXT.md
+company_research.csv
+results/
