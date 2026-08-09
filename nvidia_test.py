@@ -12,15 +12,22 @@ from ddgs import DDGS
 from dotenv import load_dotenv
 
 
-DEFAULT_MODEL = "openai/gpt-oss-20b"
+DEFAULT_MODEL = "thinkingmachines/inkling"
 DEFAULT_COMPANY = "Val Town"
 DEFAULT_REPORT_PATH = "results/company_research.md"
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-ABSTRACT_EMAIL_VALIDATION_URL = "https://emailvalidation.abstractapi.com/v1/"
+ABSTRACT_EMAIL_VALIDATION_URL = "https://emailreputation.abstractapi.com/v1/?api_key=4d9e3593f7c84481973f3ee6c6ba0dc8&email=utsavbhalani.tech@gmail.com"
 ABSTRACT_RATE_LIMIT_DELAY_SECONDS = 1.1
 MAX_TOOL_ROUNDS = 10
 MAX_PAGE_CHARS = 12000
 CONFIDENCE_VALUES = {"high", "medium", "low", "unverifiable"}
+EMAIL_REGEX = re.compile(
+    r"^(?=.{1,254}$)(?=.{1,64}@)"
+    r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,63}$",
+    re.IGNORECASE,
+)
+OBFUSCATED_LOCAL_PART_MARKERS = {"protected", "email", "hidden", "obfuscated", "encoded"}
 
 STAGE_SIZE_SCHEMA = {
     "stage": "string or null",
@@ -179,13 +186,92 @@ def call_abstract_email_validation(email: str, api_key: str) -> dict[str, Any]:
     return data
 
 
+def is_plausible_email(email_string: object) -> bool:
+    email = str(email_string or "").strip()
+    if not EMAIL_REGEX.fullmatch(email):
+        return False
+
+    local_part = email.rsplit("@", 1)[0].lower()
+    return not any(marker in local_part for marker in OBFUSCATED_LOCAL_PART_MARKERS)
+
+
+def normalize_domain(value: object) -> str:
+    domain = str(value or "").strip().lower()
+    domain = re.sub(r"^https?://", "", domain)
+    domain = domain.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    return domain.removeprefix("www.").strip()
+
+
+def infer_first_email(person: dict[str, Any] | None, domain: object) -> str | None:
+    normalized_domain = normalize_domain(domain)
+    if "." not in normalized_domain:
+        return None
+
+    name = str((person or {}).get("name") or "").strip()
+    first_name_match = re.search(r"[A-Za-z][A-Za-z'-]*", name)
+    if not first_name_match:
+        return None
+
+    first_name = re.sub(r"[^a-z0-9]", "", first_name_match.group(0).lower())
+    candidate = f"{first_name}@{normalized_domain}" if first_name else ""
+    return candidate if is_plausible_email(candidate) else None
+
+
+def guard_scraped_email(email_result: dict[str, Any], person: dict[str, Any] | None = None) -> dict[str, Any]:
+    guarded = dict(email_result or {})
+    email = str(guarded.get("email") or "").strip()
+    if not email or is_plausible_email(email):
+        if email:
+            guarded["email"] = email
+        return guarded
+
+    domain = guarded.get("domain") or (email.rsplit("@", 1)[-1] if "@" in email else None)
+    inferred_email = infer_first_email(person, domain)
+    obfuscation_note = (
+        f"Rejected scraped email '{email}' because it is not a plausible real address "
+        "or appears to be an anti-scraping placeholder; the source page likely uses email obfuscation."
+    )
+
+    if inferred_email:
+        guarded.update(
+            {
+                "email": inferred_email,
+                "is_inferred": True,
+                "pattern": "first@domain",
+                "domain": normalize_domain(domain),
+                "confidence": "low",
+                "needs_manual_check": True,
+                "verification_status": None,
+                "notes": append_note(guarded.get("notes"), obfuscation_note),
+            }
+        )
+        return guarded
+
+    guarded.update(
+        {
+            "email": None,
+            "is_inferred": False,
+            "pattern": None,
+            "domain": normalize_domain(domain) or guarded.get("domain"),
+            "confidence": "low",
+            "needs_manual_check": True,
+            "verification_status": "skipped",
+            "notes": append_note(
+                guarded.get("notes"),
+                f"{obfuscation_note} No first@domain fallback could be inferred from the available person/domain context.",
+            ),
+        }
+    )
+    return guarded
+
+
 def confidence_for_verification_status(status: str) -> str:
     return "high" if status == "valid" else "low"
 
 
-def verify_email(email_result: dict[str, Any]) -> dict[str, Any]:
+def verify_email(email_result: dict[str, Any], person: dict[str, Any] | None = None) -> dict[str, Any]:
     """Verify an email with Abstract API and guard inferred emails against catch-all domains."""
-    verified = dict(email_result or {})
+    verified = guard_scraped_email(email_result, person)
     email = str(verified.get("email") or "").strip()
     verified.setdefault("needs_manual_check", False)
     verified.setdefault("is_catch_all_domain", False)
@@ -413,6 +499,8 @@ def build_agent_prompt(task: str, schema: dict[str, Any], context: dict[str, Any
         "Use web_search for discovery and fetch_page only for URLs likely to contain direct evidence. "
         "Do not repeat equivalent searches. Do not keep searching for fields after the available evidence is exhausted. "
         "Only treat emails as verified when they are explicitly visible in fetched page text or search snippets. "
+        "Reject scraped emails whose local part contains protected, email, hidden, obfuscated, or encoded; "
+        "those are anti-scraping placeholders, not found addresses. "
         "When the task asks for email inference, mark is_inferred=true and keep confidence low unless a source verifies the address.\n\n"
         f"Prior context:\n{context_text}\n\n"
         "Return only one valid JSON object matching this schema:\n"
@@ -469,7 +557,8 @@ def force_final_answer(
             "content": (
                 "Stop using tools. Based only on the evidence already returned by tools, "
                 "produce the final JSON now. Use null for unknown fields. If an email is only "
-                "inferred, clearly set is_inferred=true."
+                "inferred, clearly set is_inferred=true. Do not return anti-scraping placeholder "
+                "emails whose local part contains protected, email, hidden, obfuscated, or encoded."
             ),
         }
     )
@@ -660,7 +749,7 @@ def save_company_research_report(record: dict[str, Any], report_path: str | None
 
     snapshot_path = os.path.join(
         report_dir or ".",
-        f"results/company_research_{company_slug}_{timestamp}.md",
+        f"company_research_{timestamp}.md",
     )
     with open(snapshot_path, "w", encoding="utf-8") as snapshot:
         snapshot.write(f"# Company Research\n\n{entry}\n")
@@ -735,6 +824,8 @@ def research_company(company_name: str, report_path: str | None = None) -> dict[
             "Find or infer the person's email. First search for a public verified email for the person. "
             "If none is visible, infer a likely address from the company domain using common patterns such as "
             "first@domain, first.last@domain, firstinitiallast@domain, or firstlast@domain. "
+            "Do not accept scraped placeholder addresses whose local part contains protected, email, hidden, "
+            "obfuscated, or encoded; fall back to inference or null with an obfuscation note. "
             "Never mark an inferred address as verified."
         ),
         schema=EMAIL_SCHEMA,
@@ -747,7 +838,7 @@ def research_company(company_name: str, report_path: str | None = None) -> dict[
         max_fetches=1,
         max_contact_searches=2,
     )
-    email = verify_email(email)
+    email = verify_email(email, person)
 
     personalization = run_agent(
         api_key=api_key,
